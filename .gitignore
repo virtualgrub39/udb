@@ -1,0 +1,4 @@
+udb
+*.o
+.vscode
+config.h
