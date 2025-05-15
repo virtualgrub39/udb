@@ -55,17 +55,103 @@ db_init(void)
 }
 
 void
-db_load_from_file(GError** error)
+db_save_to_file(GError **error)
 {
-    UDB_UNUSED(error);
-    UDB_TODO("db_load_from_file()");
+    g_return_if_fail(db_file_path != NULL);
+
+    GKeyFile *keyfile = g_key_file_new();
+    if (!keyfile) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    G_FILE_ERROR_NOMEM,
+                    "Failed to allocate GKeyFile");
+        return;
+    }
+
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, db_mem);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        g_key_file_set_string(
+            keyfile,
+            UDB_DB_SECTION,
+            (const gchar *)key,
+            (const gchar *)value);
+    }
+
+    gsize length = 0;
+    gchar *data = g_key_file_to_data(keyfile, &length, error);
+    if (data == NULL) {
+        g_key_file_free(keyfile);
+        return;
+    }
+
+    g_file_set_contents(
+        db_file_path,
+        data,
+        length,
+        error);
+
+    g_free(data);
+    g_key_file_free(keyfile);
 }
 
 void
-db_save_to_file(GError** error)
+db_load_from_file(GError **error)
 {
-    UDB_UNUSED(error);
-    UDB_TODO("db_save_to_file()");
+    g_return_if_fail(db_file_path != NULL);
+
+    GKeyFile *keyfile = g_key_file_new();
+    if (!keyfile) {
+        g_set_error(
+            error,
+            G_FILE_ERROR,
+            G_FILE_ERROR_NOMEM,
+            "Failed to allocate GKeyFile");
+        return;
+    }
+
+    if (!g_key_file_load_from_file(
+        keyfile,
+        db_file_path,
+        G_KEY_FILE_NONE,
+        error))
+    {
+        g_key_file_free(keyfile);
+        return;
+    }
+
+    g_hash_table_remove_all(db_mem);
+
+    gsize n_keys = 0;
+    gchar **keys = g_key_file_get_keys(
+        keyfile,
+        UDB_DB_SECTION,
+        &n_keys,
+        error);
+
+    if (keys == NULL && n_keys == 0) {
+        g_key_file_free(keyfile);
+        return;
+    }
+
+    for (gsize i = 0; i < n_keys; i++) {
+        const gchar *val = g_key_file_get_string(
+            keyfile,
+            UDB_DB_SECTION,
+            keys[i],
+            NULL);
+
+        if (val) {
+            g_hash_table_insert(
+                db_mem,
+                g_strdup(keys[i]),
+                g_strdup(val));
+        }
+    }
+
+    g_strfreev(keys);
+    g_key_file_free(keyfile);
 }
 
 void
@@ -455,8 +541,8 @@ main(int argc, char* argv[])
 
     if (db_file_path) {
         db_load_from_file(&error);
-        if (error) {
-            g_printerr("%s: %s\n", argv[0], error->message);
+        if (error && error->code != G_FILE_ERROR_NOENT) { // if doesn't exist, just create it
+            g_printerr("%s: (%u) %s\n", argv[0], error->code, error->message);
             return error->code;
         }
 

@@ -2,3 +2,4 @@ udb
 *.o
 .vscode
 config.h
+db
