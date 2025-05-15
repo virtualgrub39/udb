@@ -1,6 +1,8 @@
 #include <gio/gio.h>
 #include <glib.h>
 
+#include <signal.h>
+
 #include "config.h"
 
 #define UDB_UNUSED(var) (void)var;
@@ -28,8 +30,17 @@ static GOptionEntry cmd_entries[] = {
     G_OPTION_ENTRY_NULL,
 };
 
+static GMainLoop* loop;
+static volatile sig_atomic_t got_sigint = 0;
 static GHashTable* db_mem = NULL;
 static GMutex db_mutex;
+
+static void
+sigint_handler(int signum)
+{
+    UDB_UNUSED(signum);
+    got_sigint = 1;
+}
 
 void
 db_init(void)
@@ -43,22 +54,18 @@ db_init(void)
     );
 }
 
-gboolean
+void
 db_load_from_file(GError** error)
 {
-    if (!db_file_path) return TRUE;
     UDB_UNUSED(error);
     UDB_TODO("db_load_from_file()");
-    return FALSE;
 }
 
-gboolean
+void
 db_save_to_file(GError** error)
 {
-    if (!db_file_path) return TRUE;
     UDB_UNUSED(error);
     UDB_TODO("db_save_to_file()");
-    return FALSE;
 }
 
 void
@@ -91,6 +98,24 @@ db_remove(const char* key) {
     gboolean result = g_hash_table_remove(db_mem, key);
     g_mutex_unlock(&db_mutex);
     return result;
+}
+
+static gboolean
+on_db_save_timeout(gpointer user_data)
+{
+    UDB_UNUSED(user_data);
+    GError* error = NULL;
+
+    g_mutex_lock(&db_mutex);
+    db_save_to_file(&error);
+    g_mutex_unlock(&db_mutex);
+
+    if (error) {
+        g_printerr("[db-save] Error: %s\n", error->message);
+        g_error_free(error);
+    }
+
+    return G_SOURCE_CONTINUE;
 }
 
 GScanner* udb_scanner;
@@ -265,7 +290,7 @@ on_write_done (GObject      *source,
     g_output_stream_write_finish (out, res, &error);
 
     if (error) {
-        g_warning ("Write error: %s", error->message);
+        g_warning ("[write] Error: %s", error->message);
         g_clear_error (&error);
     }
 }
@@ -361,14 +386,33 @@ on_incoming (GSocketService    *service,
 
     g_object_ref(connection);
 
-    g_print("Client connected\n");
-
     GInputStream* in = g_io_stream_get_input_stream(G_IO_STREAM(connection));
     GDataInputStream* din = g_data_input_stream_new(in);
 
     g_data_input_stream_read_line_async(din, G_PRIORITY_DEFAULT, NULL, on_line_read, connection);
 
     return TRUE;
+}
+
+static gboolean
+on_check_sigint(gpointer user_data)
+{
+    UDB_UNUSED(user_data);
+    if (!got_sigint) return G_SOURCE_CONTINUE;
+
+    GError* error = NULL;
+
+    g_mutex_lock(&db_mutex);
+    db_save_to_file(&error);
+    g_mutex_unlock(&db_mutex);
+
+    if (error) {
+        g_printerr("[db-save] Error: %s\n", error->message);
+        g_error_free(error);
+    }
+
+    g_main_loop_quit(loop);
+    return G_SOURCE_REMOVE;
 }
 
 int
@@ -384,6 +428,7 @@ main(int argc, char* argv[])
     }
 
     unlink(socket_path);
+    signal(SIGINT, sigint_handler);
 
     GSocketService* socket_srvc = g_socket_service_new();
     if (!socket_srvc) {
@@ -409,15 +454,30 @@ main(int argc, char* argv[])
     udb_scanner_init();
 
     if (db_file_path) {
-        if (!db_load_from_file(&error)) {
+        db_load_from_file(&error);
+        if (error) {
             g_printerr("%s: %s\n", argv[0], error->message);
             return error->code;
         }
+
+        g_timeout_add_seconds(
+            UDB_DATABASE_SAVE_INTERVAL_SECS,
+            on_db_save_timeout,
+            NULL);
     }
+
+    g_idle_add(on_check_sigint, NULL);
 
     g_socket_service_start(socket_srvc);
     g_print("Listening on %s\n", socket_path);
 
-    g_main_loop_run(g_main_loop_new(NULL, FALSE));
-    g_assert_not_reached();
+    loop = g_main_loop_new(NULL, FALSE);
+
+    g_main_loop_run(loop);
+    
+    g_main_loop_unref(loop);
+    g_mutex_clear(&db_mutex);
+    g_hash_table_destroy(db_mem);
+
+    return EXIT_SUCCESS;
 }
