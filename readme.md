@@ -31,8 +31,8 @@ Running this command will also create config.h file, that can be used to customi
 ```
 
 #### Options:
-- `--socket-path`, `-p` - specify the path to unix socket, the server will listen on. The default value can be modified in `config.h` by changing `UDB_SOCKET_PATH_DEFAULT` definition.
-- `--db-file`, `-f` - provide the path to file, where database state will be saved. `NULL` by default (database doesn't persist it's state).
+- `--socket-path`, `-p` - specify the path to unix socket the server will listen on. The default value can be modified in `config.h` by changing `UDB_SOCKET_PATH_DEFAULT` definition.
+- `--db-file`, `-f` - provide the path to file, where database state will be saved. `NULL` by default (database doesn't persist it's state by default).
 
 ### Server usage (protocol):
 
@@ -72,7 +72,7 @@ as testing client.
 - `SET <variable name> <value>\r\n` - store `value` into `variable name`. Server will reply with error message or `OK`.
 - `DEL <variable name>\r\n` - delete value from `variable name`. Server will reply with `OK`, even if the value of `variable name` was never set.
 
-`variable name` must be either a valid C identifier (as defined by GScanner - tbh I'm not even sure what it couts as valid) or a valid **ACII** string, encaplsulated by double quotes. Example:
+`variable name` must be either a valid C identifier (as defined by GScanner - tbh I'm not even sure what GScanner considers valid.) or a valid **ACII** string, encaplsulated by double quotes. Example:
 
 - *VALID COMMANDS*: `GET "fancy var name 123"`; `SET my_waifu420 "what am I even doing right now"`
 - *INVALID COMMANDS*: `SET 420isafunnynumber 69isalsoafunnynumber`
