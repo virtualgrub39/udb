@@ -12,20 +12,24 @@ char* socket_path = UDB_SOCKET_PATH_DEFAULT;
 char* db_file_path = NULL;
 static GOptionEntry cmd_entries[] = {
     {
-        .long_name        = "socket-path", .short_name = 'p',
-        .description      = "Path to file where the unix socket will be created",
-        .arg              = G_OPTION_ARG_STRING,
-        .flags            = G_OPTION_FLAG_NONE,
-        .arg_data         = &socket_path,
-        .arg_description  = "PATH",
+      .long_name = "socket-path",
+      .short_name = 'p',
+      .description = "Path to file where the unix socket will be created. "
+                     "Default: /tmp/udb.sock",
+      .arg = G_OPTION_ARG_STRING,
+      .flags = G_OPTION_FLAG_NONE,
+      .arg_data = &socket_path,
+      .arg_description = "PATH",
     },
     {
-        .long_name        = "db-file", .short_name = 'f',
-        .description      = "Path to file where database state will be saved",
-        .arg              = G_OPTION_ARG_FILENAME,
-        .flags            = G_OPTION_FLAG_NONE,
-        .arg_data         = &db_file_path,
-        .arg_description  = "FILE",
+      .long_name = "db-file",
+      .short_name = 'f',
+      .description = "Path to file where database state will be saved. "
+                     "Default: NULL (database is not persisted)",
+      .arg = G_OPTION_ARG_FILENAME,
+      .flags = G_OPTION_FLAG_NONE,
+      .arg_data = &db_file_path,
+      .arg_description = "FILE",
     },
     G_OPTION_ENTRY_NULL,
 };
@@ -46,20 +50,15 @@ void
 db_init(void)
 {
     g_mutex_init(&db_mutex);
-    db_mem = g_hash_table_new_full(
-        g_str_hash,
-        g_str_equal,
-        g_free,
-        g_free
-    );
+    db_mem = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 }
 
 void
-db_save_to_file(GError **error)
+db_save_to_file(GError** error)
 {
     g_return_if_fail(db_file_path != NULL);
 
-    GKeyFile *keyfile = g_key_file_new();
+    GKeyFile* keyfile = g_key_file_new();
     if (!keyfile) {
         g_set_error(error,
                     G_FILE_ERROR,
@@ -73,50 +72,40 @@ db_save_to_file(GError **error)
     g_hash_table_iter_init(&iter, db_mem);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         g_key_file_set_string(
-            keyfile,
-            UDB_DB_SECTION,
-            (const gchar *)key,
-            (const gchar *)value);
+          keyfile, UDB_DB_SECTION, (const gchar*)key, (const gchar*)value);
     }
 
     gsize length = 0;
-    gchar *data = g_key_file_to_data(keyfile, &length, error);
+    gchar* data = g_key_file_to_data(keyfile, &length, error);
     if (data == NULL) {
         g_key_file_free(keyfile);
         return;
     }
 
-    g_file_set_contents(
-        db_file_path,
-        data,
-        length,
-        error);
+    g_file_set_contents(db_file_path, data, length, error);
 
     g_free(data);
     g_key_file_free(keyfile);
+
+    *error = NULL;
 }
 
 void
-db_load_from_file(GError **error)
+db_load_from_file(GError** error)
 {
     g_return_if_fail(db_file_path != NULL);
 
-    GKeyFile *keyfile = g_key_file_new();
+    GKeyFile* keyfile = g_key_file_new();
     if (!keyfile) {
-        g_set_error(
-            error,
-            G_FILE_ERROR,
-            G_FILE_ERROR_NOMEM,
-            "Failed to allocate GKeyFile");
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    G_FILE_ERROR_NOMEM,
+                    "Failed to allocate GKeyFile");
         return;
     }
 
     if (!g_key_file_load_from_file(
-        keyfile,
-        db_file_path,
-        G_KEY_FILE_NONE,
-        error))
-    {
+          keyfile, db_file_path, G_KEY_FILE_NONE, error)) {
         g_key_file_free(keyfile);
         return;
     }
@@ -124,11 +113,7 @@ db_load_from_file(GError **error)
     g_hash_table_remove_all(db_mem);
 
     gsize n_keys = 0;
-    gchar **keys = g_key_file_get_keys(
-        keyfile,
-        UDB_DB_SECTION,
-        &n_keys,
-        error);
+    gchar** keys = g_key_file_get_keys(keyfile, UDB_DB_SECTION, &n_keys, error);
 
     if (keys == NULL && n_keys == 0) {
         g_key_file_free(keyfile);
@@ -136,26 +121,23 @@ db_load_from_file(GError **error)
     }
 
     for (gsize i = 0; i < n_keys; i++) {
-        const gchar *val = g_key_file_get_string(
-            keyfile,
-            UDB_DB_SECTION,
-            keys[i],
-            NULL);
+        const gchar* val =
+          g_key_file_get_string(keyfile, UDB_DB_SECTION, keys[i], NULL);
 
         if (val) {
-            g_hash_table_insert(
-                db_mem,
-                g_strdup(keys[i]),
-                g_strdup(val));
+            g_hash_table_insert(db_mem, g_strdup(keys[i]), g_strdup(val));
         }
     }
 
     g_strfreev(keys);
     g_key_file_free(keyfile);
+
+    *error = NULL;
 }
 
 void
-db_deinit() {
+db_deinit()
+{
     g_mutex_clear(&db_mutex);
     g_hash_table_destroy(db_mem);
 }
@@ -164,7 +146,8 @@ gboolean
 db_insert(const char* key, const char* value)
 {
     g_mutex_lock(&db_mutex);
-    gboolean result = g_hash_table_insert(db_mem, g_strdup(key), g_strdup(value));
+    gboolean result =
+      g_hash_table_insert(db_mem, g_strdup(key), g_strdup(value));
     g_mutex_unlock(&db_mutex);
     return result;
 }
@@ -179,7 +162,8 @@ db_lookup(const char* key)
 }
 
 gboolean
-db_remove(const char* key) {
+db_remove(const char* key)
+{
     g_mutex_lock(&db_mutex);
     gboolean result = g_hash_table_remove(db_mem, key);
     g_mutex_unlock(&db_mutex);
@@ -211,28 +195,29 @@ void
 udb_scanner_init(void)
 {
     g_mutex_init(&scanner_mutex);
-   
+
     udb_scanner = g_scanner_new(NULL);
-   
+
     udb_scanner->config->cset_skip_characters = " \t\r\n";
-    
+
     udb_scanner->config->cset_identifier_first = G_CSET_a_2_z G_CSET_A_2_Z "_";
-    udb_scanner->config->cset_identifier_nth = G_CSET_a_2_z G_CSET_A_2_Z G_CSET_DIGITS "_";
-   
+    udb_scanner->config->cset_identifier_nth =
+      G_CSET_a_2_z G_CSET_A_2_Z G_CSET_DIGITS "_";
+
     udb_scanner->config->scan_identifier = TRUE;
     udb_scanner->config->scan_identifier_1char = TRUE;
-   
+
     udb_scanner->config->scan_binary = TRUE;
     udb_scanner->config->scan_octal = TRUE;
     udb_scanner->config->scan_float = TRUE;
     udb_scanner->config->scan_hex = TRUE;
-    
+
     udb_scanner->config->scan_string_sq = TRUE;
     udb_scanner->config->scan_string_dq = TRUE;
-    
+
     udb_scanner->config->numbers_2_int = TRUE;
     udb_scanner->config->int_2_float = FALSE;
-    
+
     udb_scanner->config->scan_comment_multi = FALSE;
     udb_scanner->config->skip_comment_single = FALSE;
     udb_scanner->config->skip_comment_multi = FALSE;
@@ -249,21 +234,23 @@ udb_handle_get(void)
     gchar* key = NULL;
 
     switch (varname_token) {
-    case G_TOKEN_IDENTIFIER:
-        key = udb_scanner->value.v_identifier;
-        break;
-    case G_TOKEN_STRING:
-        key = udb_scanner->value.v_string;
-        break;
-    default: return g_strdup_printf("ERR Missing KEY (token=%d)\r\n", varname_token);
+        case G_TOKEN_IDENTIFIER:
+            key = udb_scanner->value.v_identifier;
+            break;
+        case G_TOKEN_STRING:
+            key = udb_scanner->value.v_string;
+            break;
+        default:
+            return g_strdup_printf("ERR Missing KEY (token=%d)\r\n",
+                                   varname_token);
     }
 
     gchar* result = db_lookup(key);
-    
+
     if (!result) {
         return g_strdup_printf("NULL\r\n");
     }
-    
+
     return g_strdup_printf("%s\r\n", result);
 }
 
@@ -274,26 +261,28 @@ udb_handle_set(void)
     gchar* key = NULL;
 
     switch (tA) {
-    case G_TOKEN_IDENTIFIER:
-        key = udb_scanner->value.v_identifier;
-        break;
-    case G_TOKEN_STRING:
-        key = udb_scanner->value.v_string;
-        break;
-    default: return g_strdup_printf("ERR Missing KEY (token=%d)\r\n", tA);
+        case G_TOKEN_IDENTIFIER:
+            key = udb_scanner->value.v_identifier;
+            break;
+        case G_TOKEN_STRING:
+            key = udb_scanner->value.v_string;
+            break;
+        default:
+            return g_strdup_printf("ERR Missing KEY (token=%d)\r\n", tA);
     }
 
     if (strlen(key) > UDB_MAX_KEY_LENGTH)
         return g_strdup_printf("ERR Key To Long\r\n");
 
     key = g_strdup(key);
-   
+
     GTokenType tB = g_scanner_get_next_token(udb_scanner);
     gchar* value = NULL;
-   
+
     switch (tB) {
         case G_TOKEN_IDENTIFIER:
-            value = g_strdup(udb_scanner->value.v_identifier); // treat as string
+            value =
+              g_strdup(udb_scanner->value.v_identifier); // treat as string
             break;
         case G_TOKEN_INT:
             value = g_strdup_printf("%ld", udb_scanner->value.v_int);
@@ -309,16 +298,17 @@ udb_handle_set(void)
             return g_strdup_printf("ERR Missing Value Argument\r\n");
         default:
             g_free(key);
-            return g_strdup_printf("ERR Malformed Value Argument (token=%d)\r\n", tB);
+            return g_strdup_printf(
+              "ERR Malformed Value Argument (token=%d)\r\n", tB);
     }
-   
+
     if (!value) {
         g_free(key);
         return g_strdup_printf("ERR NULL Value\r\n");
     }
 
     db_insert(key, value);
-   
+
     g_free(key);
     g_free(value);
     return g_strdup_printf("OK\r\n");
@@ -331,13 +321,15 @@ udb_handle_del(void)
     gchar* key = NULL;
 
     switch (varname_token) {
-    case G_TOKEN_IDENTIFIER:
-        key = udb_scanner->value.v_identifier;
-        break;
-    case G_TOKEN_STRING:
-        key = udb_scanner->value.v_string;
-        break;
-    default: return g_strdup_printf("ERR Missing KEY (token=%d)\r\n", varname_token);
+        case G_TOKEN_IDENTIFIER:
+            key = udb_scanner->value.v_identifier;
+            break;
+        case G_TOKEN_STRING:
+            key = udb_scanner->value.v_string;
+            break;
+        default:
+            return g_strdup_printf("ERR Missing KEY (token=%d)\r\n",
+                                   varname_token);
     }
 
     db_remove(key); // returns true, if key actually existed. We don't care.
@@ -364,41 +356,40 @@ static UDB_CommandEntry udb_commands[] = {
 };
 
 static void
-on_write_done (GObject      *source,
-               GAsyncResult *res,
-               gpointer      user_data)
+on_write_done(GObject* source, GAsyncResult* res, gpointer user_data)
 {
     UDB_UNUSED(user_data);
 
-    GOutputStream *out = G_OUTPUT_STREAM (source);
-    GError *error = NULL;
+    GOutputStream* out = G_OUTPUT_STREAM(source);
+    GError* error = NULL;
 
-    g_output_stream_write_finish (out, res, &error);
+    g_output_stream_write_finish(out, res, &error);
 
     if (error) {
-        g_warning ("[write] Error: %s", error->message);
-        g_clear_error (&error);
+        g_warning("[write] Error: %s", error->message);
+        g_clear_error(&error);
     }
 }
 
-gchar* 
+gchar*
 process_command_line(const gchar* line)
 {
     g_mutex_lock(&scanner_mutex);
-    
+
     g_scanner_input_text(udb_scanner, line, -1);
     gchar* response = NULL;
-    
+
     GTokenType tok = g_scanner_get_next_token(udb_scanner);
     if (tok != G_TOKEN_IDENTIFIER) {
-        response = g_strdup_printf("ERR Expected Command Identifier (got token=%d)\r\n", tok);
+        response = g_strdup_printf(
+          "ERR Expected Command Identifier (got token=%d)\r\n", tok);
         g_mutex_unlock(&scanner_mutex);
         return response;
     }
-    
+
     const gchar* cmd = udb_scanner->value.v_identifier;
     gboolean command_found = FALSE;
-    
+
     for (UDB_CommandEntry* e = udb_commands; e->name; ++e) {
         if (g_ascii_strcasecmp(cmd, e->name) == 0) {
             response = e->fn();
@@ -406,31 +397,30 @@ process_command_line(const gchar* line)
             break;
         }
     }
-    
+
     if (!command_found) {
         response = g_strdup_printf("ERR Unknown command: %s\r\n", cmd);
     }
-    
+
     g_mutex_unlock(&scanner_mutex);
     return response;
 }
 
 static void
-on_line_read (GObject      *source_object,
-              GAsyncResult *res,
-              gpointer      user_data)
+on_line_read(GObject* source_object, GAsyncResult* res, gpointer user_data)
 {
-    GDataInputStream* din = G_DATA_INPUT_STREAM (source_object);
-    GSocketConnection* conn = G_SOCKET_CONNECTION (user_data);
+    GDataInputStream* din = G_DATA_INPUT_STREAM(source_object);
+    GSocketConnection* conn = G_SOCKET_CONNECTION(user_data);
 
     GError* error = NULL;
     gsize length = 0;
-    gchar* line = g_data_input_stream_read_line_finish (din, res, &length, &error);
+    gchar* line =
+      g_data_input_stream_read_line_finish(din, res, &length, &error);
 
     if (error != NULL) {
-        g_warning ("Read error: %s", error->message);
-        g_clear_error (&error);
-        g_object_unref (conn);
+        g_warning("Read error: %s", error->message);
+        g_clear_error(&error);
+        g_object_unref(conn);
         return;
     }
 
@@ -440,7 +430,8 @@ on_line_read (GObject      *source_object,
         return;
     }
 
-    if (g_str_has_suffix(line, "\r")) // \r is not considered part of newline by `g_data_input_stream_read_line_async`
+    if (g_str_has_suffix(line, "\r")) // \r is not considered part of newline by
+                                      // `g_data_input_stream_read_line_async`
         line[strlen(line) - 1] = '\0';
 
     g_print("Received: %s\n", line);
@@ -448,23 +439,26 @@ on_line_read (GObject      *source_object,
 
     GOutputStream* out = g_io_stream_get_output_stream(G_IO_STREAM(conn));
 
-    g_output_stream_write_async(
-        out, response, strlen(response), G_PRIORITY_DEFAULT,
-        NULL, on_write_done,
-        NULL);
+    g_output_stream_write_async(out,
+                                response,
+                                strlen(response),
+                                G_PRIORITY_DEFAULT,
+                                NULL,
+                                on_write_done,
+                                NULL);
 
     g_free(response);
     g_free(line);
 
     g_data_input_stream_read_line_async(
-        din, G_PRIORITY_DEFAULT, NULL, on_line_read, conn);
+      din, G_PRIORITY_DEFAULT, NULL, on_line_read, conn);
 }
 
 static gboolean
-on_incoming (GSocketService    *service,
-             GSocketConnection *connection,
-             GObject           *source_object,
-             gpointer           user_data)
+on_incoming(GSocketService* service,
+            GSocketConnection* connection,
+            GObject* source_object,
+            gpointer user_data)
 {
     UDB_UNUSED(source_object);
     UDB_UNUSED(service);
@@ -475,7 +469,8 @@ on_incoming (GSocketService    *service,
     GInputStream* in = g_io_stream_get_input_stream(G_IO_STREAM(connection));
     GDataInputStream* din = g_data_input_stream_new(in);
 
-    g_data_input_stream_read_line_async(din, G_PRIORITY_DEFAULT, NULL, on_line_read, connection);
+    g_data_input_stream_read_line_async(
+      din, G_PRIORITY_DEFAULT, NULL, on_line_read, connection);
 
     return TRUE;
 }
@@ -484,7 +479,8 @@ static gboolean
 on_check_sigint(gpointer user_data)
 {
     UDB_UNUSED(user_data);
-    if (!got_sigint) return G_SOURCE_CONTINUE;
+    if (!got_sigint)
+        return G_SOURCE_CONTINUE;
 
     GError* error = NULL;
 
@@ -522,14 +518,16 @@ main(int argc, char* argv[])
         return error->code;
     }
 
-    GUnixSocketAddress* addr = G_UNIX_SOCKET_ADDRESS(g_unix_socket_address_new(socket_path));
-    if (!g_socket_listener_add_address(
-        G_SOCKET_LISTENER(socket_srvc),
-        G_SOCKET_ADDRESS(addr),
-        G_SOCKET_TYPE_STREAM,
-        G_SOCKET_PROTOCOL_DEFAULT,
-        NULL, NULL, &error)) {
-        
+    GUnixSocketAddress* addr =
+      G_UNIX_SOCKET_ADDRESS(g_unix_socket_address_new(socket_path));
+    if (!g_socket_listener_add_address(G_SOCKET_LISTENER(socket_srvc),
+                                       G_SOCKET_ADDRESS(addr),
+                                       G_SOCKET_TYPE_STREAM,
+                                       G_SOCKET_PROTOCOL_DEFAULT,
+                                       NULL,
+                                       NULL,
+                                       &error)) {
+
         g_printerr("%s: %s\n", argv[0], error->message);
         return error->code;
     }
@@ -541,15 +539,14 @@ main(int argc, char* argv[])
 
     if (db_file_path) {
         db_load_from_file(&error);
-        if (error && error->code != G_FILE_ERROR_NOENT) { // if doesn't exist, just create it
+        if (error && error->code !=
+                       G_FILE_ERROR_NOENT) { // if doesn't exist, just create it
             g_printerr("%s: (%u) %s\n", argv[0], error->code, error->message);
             return error->code;
         }
 
         g_timeout_add_seconds(
-            UDB_DATABASE_SAVE_INTERVAL_SECS,
-            on_db_save_timeout,
-            NULL);
+          UDB_DATABASE_SAVE_INTERVAL_SECS, on_db_save_timeout, NULL);
     }
 
     g_idle_add(on_check_sigint, NULL);
@@ -560,7 +557,7 @@ main(int argc, char* argv[])
     loop = g_main_loop_new(NULL, FALSE);
 
     g_main_loop_run(loop);
-    
+
     g_main_loop_unref(loop);
     g_mutex_clear(&db_mutex);
     g_hash_table_destroy(db_mem);
