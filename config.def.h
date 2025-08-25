@@ -3,6 +3,8 @@
 
 #define UDB_SOCKET_PATH_DEFAULT "/tmp/udb.sock"
 #define UDB_PIDFILE_PATH "/tmp/udb.pid"
+#define UDB_DATABASE_FILE_PATH_DEFAULT NULL
 #define UDB_SOCKET_BACKLOG 100
+#define UDB_DATABASE_SAVE_INTERVAL_SECS 10
 
 #endif

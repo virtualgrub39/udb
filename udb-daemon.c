@@ -5,20 +5,23 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <string.h>
 #include <sys/poll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include "ketopt.h"
+#define STB_DS_IMPLEMENTATION
+#include "stb_ds.h"
 
 #include "config.h"
 
@@ -32,6 +35,7 @@
 
 volatile bool udb_quit = false;
 int udb_sockfd = -1;
+struct pollfd *pfds = NULL;
 
 static void
 udb_signal_handler (int signo)
@@ -41,39 +45,10 @@ udb_signal_handler (int signo)
     udb_quit = true;
 }
 
-static char *udb_db_path = NULL;
+static char *udb_db_path = UDB_DATABASE_FILE_PATH_DEFAULT;
 static char *udb_socket_path = UDB_SOCKET_PATH_DEFAULT;
 
-enum
-{
-    ARG_HELP = 256,
-    ARG_DAEMONIZE,
-    ARG_SOCKET_PATH,
-    ARG_DB_PATH,
-};
-
-static const ko_longopt_t longopts[] = {
-    { "help", ko_no_argument, ARG_HELP },
-    { "daemonize", ko_no_argument, ARG_DAEMONIZE },
-    { "socket-path", ko_required_argument, ARG_SOCKET_PATH },
-    { "db-path", ko_required_argument, ARG_DB_PATH },
-    { NULL, 0, 0 },
-};
-
-static void
-usage (const char *progname)
-{
-    printf ("Usage: %s [FLAGS]\n", progname);
-    printf ("FLAGS:\n");
-    printf ("\t-h, --help        - display this message\n");
-    printf ("\t-d, --daemonize   - daemonize using double-fork method\n");
-    printf ("\t-s, --socket-path - change path to unix socket. DEFAULT: %s\n",
-            UDB_SOCKET_PATH_DEFAULT);
-    printf ("\t-p, --db-path     - provide path to database file. DEFAULT: NULL (database state "
-            "not persisted)\n");
-}
-
-int
+static int
 write_pidfile (const char *path)
 {
     mode_t oldmask = umask (0);
@@ -96,6 +71,71 @@ write_pidfile (const char *path)
     fsync (fd);
     close (fd);
     return 0;
+}
+
+static int
+make_timerfd (int initial_sec, int interval_sec)
+{
+    int tfd = timerfd_create (CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0)
+        return tfd;
+
+    struct itimerspec its = { 0 };
+    its.it_value.tv_sec = initial_sec;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = interval_sec;
+    its.it_interval.tv_nsec = 0;
+
+    if (timerfd_settime (tfd, 0, &its, NULL) < 0)
+    {
+        close (tfd);
+        return -1;
+    }
+
+    return tfd;
+}
+
+static int
+udb_load_from_file (void)
+{
+    fprintf (stdout, "udb_load_from_file() called\n");
+    return 0;
+}
+
+static int
+udb_save_to_file (void)
+{
+    fprintf (stdout, "udb_save_to_file() called\n");
+    return 0;
+}
+
+enum
+{
+    ARG_HELP = 256,
+    ARG_DAEMONIZE,
+    ARG_SOCKET_PATH,
+    ARG_DB_PATH,
+};
+
+static const ko_longopt_t longopts[] = {
+    { "help", ko_no_argument, ARG_HELP },
+    { "daemonize", ko_no_argument, ARG_DAEMONIZE },
+    { "socket-path", ko_required_argument, ARG_SOCKET_PATH },
+    { "db-path", ko_required_argument, ARG_DB_PATH },
+    { NULL, 0, 0 },
+};
+
+static void
+usage (const char *progname)
+{
+    printf ("Usage: %s [FLAGS] [ARGS]\n", progname);
+    printf ("FLAGS:\n");
+    printf ("\t-h, --help        - display this message\n");
+    printf ("\t-d, --daemonize   - daemonize using double-fork method (not recommended - use systemd like a normal person)\n");
+    printf ("ARGS:\n");
+    printf ("\t-s, --socket-path - change path to unix socket. DEFAULT: %s\n",
+            UDB_SOCKET_PATH_DEFAULT);
+    printf ("\t-p, --db-path     - provide path to database file. DEFAULT: %s\n", UDB_DATABASE_FILE_PATH_DEFAULT ? UDB_DATABASE_FILE_PATH_DEFAULT : "NULL (database state not persisted)");
 }
 
 static void
@@ -187,8 +227,9 @@ int
 main (int argc, char *argv[])
 {
     ketopt_t s = KETOPT_INIT;
-    int c;
-    const char *optstr = "hd";
+    int c = 0;
+    const char *optstr = "hds:p:";
+    int err = -1;
 
     bool do_daemonize = false;
 
@@ -242,8 +283,6 @@ main (int argc, char *argv[])
     struct sockaddr_un unsockaddr = { 0 };
     unsockaddr.sun_family = AF_UNIX;
     strncpy (unsockaddr.sun_path, udb_socket_path, sizeof (unsockaddr.sun_path) - 1);
-
-    int err;
 
     err = bind (udb_sockfd, (const struct sockaddr *)&unsockaddr, sizeof (unsockaddr));
     if (err < 0)
@@ -306,7 +345,35 @@ main (int argc, char *argv[])
         perror ("chmod(udb_socket_path)");
         // not fatal
     }
-    
+
+    struct pollfd pfd;
+
+    pfd = (struct pollfd){ .fd = udb_sockfd, .events = POLLIN };
+
+    arrput (pfds, pfd);
+
+    if (udb_db_path != NULL)
+    {
+        err = udb_load_from_file ();
+        if (err != 0 && errno != ENOENT)
+        {
+            fprintf (stderr, "Failed to read database file: %s (%u)\n", strerror (errno), errno);
+            close (udb_sockfd);
+            return 1;
+        }
+
+        int udb_save_timerfd = make_timerfd (5, UDB_DATABASE_SAVE_INTERVAL_SECS);
+        if (udb_save_timerfd < 0)
+        {
+            fprintf (stderr, "Failed to create interval timer: %s (%u)\n", strerror (errno), errno);
+            close (udb_sockfd);
+            return 1;
+        }
+
+        pfd = (struct pollfd){ .fd = udb_save_timerfd, .events = POLLIN };
+        arrput (pfds, pfd);
+    }
+
     struct sigaction udb_sigaction;
     udb_sigaction.sa_handler = udb_signal_handler;
     sigemptyset (&udb_sigaction.sa_mask);
@@ -316,46 +383,89 @@ main (int argc, char *argv[])
 
     fprintf (stdout, "listening on %s\n", udb_socket_path);
 
-    struct pollfd pfd = { .fd = udb_sockfd, .events = POLLIN };
-
     while (!udb_quit)
     {
-        int err = poll(&pfd, 1, 500);
+        err = poll (pfds, arrlen (pfds), -1);
         if (err < 0)
         {
             if (errno == EINTR) // handled by udb_signal_handler
                 continue;
-            perror("poll");
+            perror ("poll");
             break;
         }
         if (err == 0) // timeout
             continue;
 
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+        for (long i = 0; i < arrlen (pfds); ++i) // check for errors on all fds
         {
-            fprintf(stderr, "poll reported error/hangup/invalid fd: revents=0x%x\n", pfd.revents);
-            break;
+            if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
+            {
+                fprintf (stderr, "poll reported error/hangup/invalid fd: revents=0x%x\n",
+                         pfds[i].revents);
+                goto udb_main_exit;
+            }
         }
 
-        if (pfd.revents & POLLIN)
+        if (pfds[0].revents & POLLIN) // socket
         {
-            int cfd = accept(udb_sockfd, NULL, NULL);
+            int cfd = accept (udb_sockfd, NULL, NULL);
             if (cfd < 0)
             {
-                if (errno == EINTR)
+                if (errno == EINTR) // handled by udb_signal_handler
                     continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                     continue;
-                perror("accept");
+                perror ("accept");
                 continue;
             }
 
-            fprintf(stdout, "client - accepted; pants - shat\n");
-            close(cfd);
+            fprintf (stdout, "client - accepted; pants - shat\n");
+            close (cfd);
+        }
+
+        if (arrlen (pfds) > 1 && pfds[1].revents & POLLIN) // timer timeout
+        {
+            unsigned long long expirations;
+            ssize_t r = read (pfds[1].fd, &expirations, sizeof (expirations));
+            if (r == sizeof (expirations)
+                && expirations > 0) // save only once, even if we've missed some expirations
+            {
+                err = udb_save_to_file ();
+                if (err < 0)
+                {
+                    fprintf (stderr, "Failed to save database to file: %s (%u)\n", strerror (errno),
+                             errno);
+                    // non-fatal?
+                }
+            }
+            else if (r < 0 && errno != EAGAIN)
+            {
+                perror ("read(timer_fd)");
+            }
         }
     }
 
-    close (udb_sockfd);
+udb_main_exit:
+    if (pfds)
+    {
+        for (long i = 0; i < arrlen (pfds); ++i)
+        {
+            close (pfds[i].fd);
+
+            if (i == 1)
+            {
+                udb_save_to_file ();
+            }
+        }
+
+        arrfree (pfds);
+        pfds = NULL;
+    }
+    else
+    {
+        close (udb_sockfd);
+    }
+
     udb_sockfd = -1;
     unlink (udb_socket_path);
     return 0;
