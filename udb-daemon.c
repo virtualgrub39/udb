@@ -91,6 +91,7 @@ udb_client_unregister_idx (size_t idx)
     if (idx < fixed_count || (size_t)idx >= n)
         return -1;
 
+    shutdown(pfds[idx].fd, SHUT_RDWR);
     close (pfds[idx].fd);
 
     UDB_ClientContext *c = clients[idx];
@@ -426,6 +427,21 @@ main (int argc, char *argv[])
         return 1;
     }
 
+    int flags = fcntl (udb_sockfd, F_GETFL, 0);
+    if (flags < 0)
+    {
+        perror ("fcntl(F_GETFL) for main socket");
+        close (udb_sockfd);
+        return 1;
+    }
+    err = fcntl (udb_sockfd, F_SETFL, flags | O_NONBLOCK | FD_CLOEXEC);
+    if (err < 0)
+    {
+        perror ("fcntl(F_SETFL) for main socket");
+        close (udb_sockfd);
+        return 1;
+    }
+
     if (chmod (udb_socket_path, 0644) < 0)
     {
         perror ("chmod(udb_socket_path)");
@@ -503,8 +519,15 @@ main (int argc, char *argv[])
         {
             unsigned long long expirations;
             ssize_t r = read (pfds[1].fd, &expirations, sizeof (expirations));
-            if (r == sizeof (expirations)
-                && expirations > 0) // save only once, even if we've missed some expirations
+            if (r < 0)
+            {
+                if (errno == EAGAIN || errno == EINTR)
+                    continue;
+                else
+                    perror ("read(timer_fd)");
+            }
+
+            if (expirations > 0)
             {
                 err = udb_save_to_file ();
                 if (err < 0)
@@ -513,10 +536,6 @@ main (int argc, char *argv[])
                              errno);
                     // non-fatal?
                 }
-            }
-            else if (r < 0 && errno != EAGAIN)
-            {
-                perror ("read(timer_fd)");
             }
         }
 
@@ -533,7 +552,7 @@ main (int argc, char *argv[])
                          pfds[i].revents);
                 goto udb_main_exit;
             }
-            if (i < (ssize_t)fixed_count)
+            if (i < (ssize_t)fixed_count) // fixed fds already handled
                 continue;
 
             UDB_ClientContext *c = clients[i];
@@ -600,9 +619,9 @@ udb_main_exit:
             }
         }
 
-        for (long i = arrlen(pfds) - 1; i >= (long)fixed_count; --i)
+        for (long i = arrlen (pfds) - 1; i >= (long)fixed_count; --i)
         {
-            udb_client_unregister_idx(i);
+            udb_client_unregister_idx (i);
         }
 
         arrfree (pfds);
@@ -615,10 +634,11 @@ udb_main_exit:
 
     if (clients)
     {
-        for (long i = fixed_count; i < arrlen(clients); ++i)
+        for (long i = fixed_count; i < arrlen (clients); ++i)
         {
-            UDB_ClientContext* c = clients[i];
-            if (c) free(c);
+            UDB_ClientContext *c = clients[i];
+            if (c)
+                free (c);
         }
 
         arrfree (clients);
