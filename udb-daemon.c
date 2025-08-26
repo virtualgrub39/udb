@@ -590,7 +590,7 @@ main (int argc, char *argv[])
 udb_main_exit:
     if (pfds)
     {
-        for (long i = 0; i < arrlen (pfds); ++i)
+        for (long i = 0; i < (long)fixed_count; ++i)
         {
             close (pfds[i].fd);
 
@@ -600,12 +600,28 @@ udb_main_exit:
             }
         }
 
+        for (long i = arrlen(pfds) - 1; i >= (long)fixed_count; --i)
+        {
+            udb_client_unregister_idx(i);
+        }
+
         arrfree (pfds);
         pfds = NULL;
     }
     else
     {
         close (udb_sockfd);
+    }
+
+    if (clients)
+    {
+        for (long i = fixed_count; i < arrlen(clients); ++i)
+        {
+            UDB_ClientContext* c = clients[i];
+            if (c) free(c);
+        }
+
+        arrfree (clients);
     }
 
     udb_sockfd = -1;
