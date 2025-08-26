@@ -33,9 +33,92 @@
         abort ();                                                                                  \
     } while (0)
 
-volatile bool udb_quit = false;
-int udb_sockfd = -1;
-struct pollfd *pfds = NULL;
+typedef struct
+{
+    ssize_t pfd_idx;
+    size_t wlen, woff;
+    char wbuf[UDB_MAX_MSG_LEN];
+} UDB_ClientContext;
+
+static volatile bool udb_quit = false;
+static int udb_sockfd = -1;
+static size_t fixed_count = 0;
+static struct pollfd *pfds = NULL;
+static UDB_ClientContext **clients = NULL;
+
+static ssize_t
+udb_add_fixed_fd (int fd, short events)
+{
+    struct pollfd p = { .fd = fd, .events = events };
+    arrput (pfds, p);
+    arrput (clients, NULL);
+    fixed_count += 1;
+    return fixed_count - 1;
+}
+
+static ssize_t
+udb_client_register_fd (int cfd)
+{
+    UDB_ClientContext *c = calloc (1, sizeof (UDB_ClientContext));
+    if (!c)
+        return -1;
+
+    struct pollfd p = { .fd = cfd, .events = POLLIN, .revents = 0 };
+
+    arrput (pfds, p);
+    arrput (clients, c);
+
+    ssize_t idx = (ssize_t)arrlen (pfds) - 1;
+    c->pfd_idx = idx;
+    return idx;
+}
+
+static void
+udb_client_pollout_set (size_t idx, bool enable)
+{
+    if (idx < fixed_count || (long)idx >= arrlen (pfds))
+        return;
+    if (enable)
+        pfds[idx].events |= POLLOUT;
+    else
+        pfds[idx].events &= ~POLLOUT;
+}
+
+static ssize_t
+udb_client_unregister_idx (size_t idx)
+{
+    size_t n = arrlen (pfds);
+    if (idx < fixed_count || (size_t)idx >= n)
+        return -1;
+
+    close (pfds[idx].fd);
+
+    UDB_ClientContext *c = clients[idx];
+    if (c)
+        free (c);
+
+    size_t last = n - 1;
+    if (idx != last)
+    {
+        pfds[idx] = pfds[last];
+        clients[idx] = clients[last];
+
+        if (clients[idx])
+            clients[idx]->pfd_idx = idx;
+    }
+
+    (void)arrpop (pfds);
+    (void)arrpop (clients);
+
+    return 0;
+}
+
+static ssize_t
+udb_client_read (size_t idx)
+{
+    fprintf (stdout, "udb_client_read(%lu) called\n", idx);
+    return -1;
+}
 
 static void
 udb_signal_handler (int signo)
@@ -131,11 +214,14 @@ usage (const char *progname)
     printf ("Usage: %s [FLAGS] [ARGS]\n", progname);
     printf ("FLAGS:\n");
     printf ("\t-h, --help        - display this message\n");
-    printf ("\t-d, --daemonize   - daemonize using double-fork method (not recommended - use systemd like a normal person)\n");
+    printf ("\t-d, --daemonize   - daemonize using double-fork method (not recommended - use "
+            "systemd like a normal person)\n");
     printf ("ARGS:\n");
     printf ("\t-s, --socket-path - change path to unix socket. DEFAULT: %s\n",
             UDB_SOCKET_PATH_DEFAULT);
-    printf ("\t-p, --db-path     - provide path to database file. DEFAULT: %s\n", UDB_DATABASE_FILE_PATH_DEFAULT ? UDB_DATABASE_FILE_PATH_DEFAULT : "NULL (database state not persisted)");
+    printf ("\t-p, --db-path     - provide path to database file. DEFAULT: %s\n",
+            UDB_DATABASE_FILE_PATH_DEFAULT ? UDB_DATABASE_FILE_PATH_DEFAULT
+                                           : "NULL (database state not persisted)");
 }
 
 static void
@@ -346,11 +432,7 @@ main (int argc, char *argv[])
         // not fatal
     }
 
-    struct pollfd pfd;
-
-    pfd = (struct pollfd){ .fd = udb_sockfd, .events = POLLIN };
-
-    arrput (pfds, pfd);
+    udb_add_fixed_fd (udb_sockfd, POLLIN);
 
     if (udb_db_path != NULL)
     {
@@ -370,8 +452,7 @@ main (int argc, char *argv[])
             return 1;
         }
 
-        pfd = (struct pollfd){ .fd = udb_save_timerfd, .events = POLLIN };
-        arrput (pfds, pfd);
+        udb_add_fixed_fd (udb_save_timerfd, POLLIN);
     }
 
     struct sigaction udb_sigaction;
@@ -396,16 +477,6 @@ main (int argc, char *argv[])
         if (err == 0) // timeout
             continue;
 
-        for (long i = 0; i < arrlen (pfds); ++i) // check for errors on all fds
-        {
-            if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
-            {
-                fprintf (stderr, "poll reported error/hangup/invalid fd: revents=0x%x\n",
-                         pfds[i].revents);
-                goto udb_main_exit;
-            }
-        }
-
         if (pfds[0].revents & POLLIN) // socket
         {
             int cfd = accept (udb_sockfd, NULL, NULL);
@@ -419,11 +490,16 @@ main (int argc, char *argv[])
                 continue;
             }
 
-            fprintf (stdout, "client - accepted; pants - shat\n");
-            close (cfd);
+            ssize_t idx = udb_client_register_fd (cfd);
+            if (idx < 0)
+            {
+                fprintf (stderr, "Failed to register client: %s (%u)\n", strerror (errno), errno);
+                close (cfd);
+                continue;
+            }
         }
 
-        if (arrlen (pfds) > 1 && pfds[1].revents & POLLIN) // timer timeout
+        if (udb_db_path && pfds[1].revents & POLLIN) // timer timeout
         {
             unsigned long long expirations;
             ssize_t r = read (pfds[1].fd, &expirations, sizeof (expirations));
@@ -441,6 +517,72 @@ main (int argc, char *argv[])
             else if (r < 0 && errno != EAGAIN)
             {
                 perror ("read(timer_fd)");
+            }
+        }
+
+        ssize_t total = arrlen (pfds);
+        for (ssize_t i = 0; i < total; ++i)
+        {
+            if (pfds[i].revents == 0)
+                continue;
+            short ev = pfds[i].revents;
+
+            if (ev & (POLLERR | POLLNVAL))
+            {
+                fprintf (stderr, "poll reported error/hangup/invalid fd: revents=0x%x\n",
+                         pfds[i].revents);
+                goto udb_main_exit;
+            }
+            if (i < (ssize_t)fixed_count)
+                continue;
+
+            UDB_ClientContext *c = clients[i];
+            if (!c)
+                UNREACHABLE;
+
+            if ((ev & POLLHUP) && !(ev & POLLIN))
+            {
+                // disconnect
+                udb_client_unregister_idx (i);
+                --i;
+                total = arrlen (pfds);
+                continue;
+            }
+
+            if (ev & POLLIN)
+            {
+                if (udb_client_read (i) < 0)
+                {
+                    // disconnect
+                    udb_client_unregister_idx (i);
+                    --i;
+                    total = arrlen (pfds);
+                    continue;
+                }
+            }
+
+            if (ev & POLLOUT)
+            {
+                if (c->wlen > c->woff)
+                {
+                    ssize_t w = write (pfds[c->pfd_idx].fd, c->wbuf + c->woff, c->wlen - c->woff);
+                    if (w > 0)
+                    {
+                        c->woff += (size_t)w;
+                        if (c->woff == c->wlen)
+                        {
+                            c->wlen = c->woff = 0;
+                            udb_client_pollout_set (i, 0);
+                        }
+                    }
+                    else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                    {
+                        udb_client_unregister_idx (i);
+                        --i;
+                        total = arrlen (pfds);
+                        continue;
+                    }
+                }
             }
         }
     }
