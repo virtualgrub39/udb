@@ -1,6 +1,4 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
+// requires _POSIX_C_SOURCE=200112L
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -91,7 +89,7 @@ udb_client_unregister_idx (size_t idx)
     if (idx < fixed_count || (size_t)idx >= n)
         return -1;
 
-    shutdown(pfds[idx].fd, SHUT_RDWR);
+    shutdown (pfds[idx].fd, SHUT_RDWR);
     close (pfds[idx].fd);
 
     UDB_ClientContext *c = clients[idx];
@@ -496,23 +494,30 @@ main (int argc, char *argv[])
         if (pfds[0].revents & POLLIN) // socket
         {
             int cfd = accept (udb_sockfd, NULL, NULL);
-            if (cfd < 0)
-            {
-                if (errno == EINTR) // handled by udb_signal_handler
-                    continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    continue;
-                perror ("accept");
-                continue;
-            }
 
-            ssize_t idx = udb_client_register_fd (cfd);
-            if (idx < 0)
+            do
             {
-                fprintf (stderr, "Failed to register client: %s (%u)\n", strerror (errno), errno);
-                close (cfd);
+                if (cfd < 0)
+                    break;
+
+                ssize_t idx = udb_client_register_fd (cfd);
+                if (idx < 0)
+                {
+                    fprintf (stderr, "Failed to register client: %s (%u)\n", strerror (errno),
+                             errno);
+                    close (cfd);
+                    continue;
+                }
+
+                cfd = accept (udb_sockfd, NULL, NULL);
+            } while (cfd > 0);
+
+            if (errno == EINTR) // handled by udb_signal_handler
                 continue;
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            perror ("accept");
+            continue;
         }
 
         if (udb_db_path && pfds[1].revents & POLLIN) // timer timeout
