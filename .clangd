@@ -11,8 +11,8 @@ CompileFlags:
       "-ffunction-sections",
       "-fdata-sections",
       "-pipe",
-      "-std=gnu11",
       "-x", "c",
-      "-I../",
+      "-std=c99",
+      "-D_POSIX_C_SOURCE=200112L",
     ]
   Compiler: gcc
