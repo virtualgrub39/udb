@@ -260,7 +260,7 @@ udb_client_unregister_idx (size_t idx)
     (void)arrpop (pfds);
     (void)arrpop (clients);
 
-    logger_log (LOG_DEBUG, "Unregistered idx=%u", idx);
+    logger_log (LOG_DEBUG, "Unregistered idx=%zu", idx);
 
     return 0;
 }
@@ -312,6 +312,30 @@ udb_client_write_async (int idx, int pfx, const char *msg)
     return 0;
 }
 
+static const char *
+udb_handle_get (TokenArray args)
+{
+    (void)args;
+    errno = ENODATA;
+    return NULL;
+}
+
+static ssize_t
+udb_handle_set (TokenArray args)
+{
+    (void)args;
+    errno = EINVAL;
+    return -1;
+}
+
+static const char *
+udb_handle_del (TokenArray args)
+{
+    (void)args;
+    errno = ENODATA;
+    return NULL;
+}
+
 static ssize_t
 udb_client_read (size_t idx)
 {
@@ -319,7 +343,6 @@ udb_client_read (size_t idx)
     if (!c)
         UNREACHABLE;
 
-    // struct pollfd cpfd = pfds[c->pfd_idx];
     int cfd = pfds[c->pfd_idx].fd;
 
     bool terminator_received = false;
@@ -327,10 +350,8 @@ udb_client_read (size_t idx)
     while (true)
     {
         ssize_t n = read (cfd, c->abuf + c->aoff, UDB_MAX_MSG_LEN - c->aoff);
-        if (n < 0)
+        if (n <= 0)
             return n;
-        if (n == 0)
-            return -1;
 
         c->aoff += n;
 
@@ -360,19 +381,70 @@ udb_client_read (size_t idx)
 
     TokenArray ta = NULL;
     ssize_t result = lexer_lex (&lexer, c->abuf, &ta);
-    if (result < 0)
+    if (result < 0 || ta[0].type != T_COMMAND)
     {
         result = udb_client_write_async (idx, UDB_PFX_ERR, "invalid command");
         c->should_exit = true;
         return result;
     }
 
-    // TODO: pass to handles (udb_handle_GET, udb_handle_PUT, udb_handle_DEL)
+    const char *cmd_ptr = ta[0].ptr;
+    size_t cmd_len = ta[0].len;
+    arrdel (ta, 0);
 
-    arrfree(ta);
+    if (strncmp (cmd_ptr, "GET", cmd_len) == 0)
+    {
+        const char *v = udb_handle_get (ta);
+        if (v == NULL)
+        {
+            switch (errno)
+            {
+            case ENODATA:
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "");
+                break;
+            default:
+                logger_log_errno (LOG_WARNING, "DB GET failed");
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "internal server error");
+                break;
+            }
+        }
 
-    result = udb_client_write_async (idx, UDB_PFX_OK, "");
-    c->should_exit = true;
+        result = udb_client_write_async (idx, UDB_PFX_OK, v);
+    }
+    else if (strncmp (cmd_ptr, "SET", cmd_len) == 0)
+    {
+        result = udb_handle_set (ta);
+        if (result < 0)
+        {
+            logger_log_errno (LOG_WARNING, "DB SET failed");
+            result = udb_client_write_async (idx, UDB_PFX_ERR, "internal server error");
+        }
+
+        result = udb_client_write_async (idx, UDB_PFX_OK, "");
+    }
+    else if (strncmp (cmd_ptr, "DEL", cmd_len) == 0)
+    {
+        const char *v = udb_handle_del (ta);
+        if (v == NULL)
+        {
+            switch (errno)
+            {
+            case ENODATA:
+                result = udb_client_write_async (idx, UDB_PFX_OK, "");
+                break;
+            default:
+                logger_log_errno (LOG_WARNING, "DB DEL failed");
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "internal server error");
+                break;
+            }
+        }
+
+        result = udb_client_write_async (idx, UDB_PFX_OK, v);
+    }
+    else
+        UNREACHABLE;
+
+    arrfree (ta);
     return result;
 }
 
@@ -957,6 +1029,15 @@ main (int argc, char *argv[])
                     if (errno == EAGAIN || errno == EINTR)
                         continue;
 
+                    // disconnect
+                    udb_client_unregister_idx (i);
+                    --i;
+                    total = arrlen (pfds);
+                    continue;
+                }
+
+                if (err == 0)
+                {
                     // disconnect
                     udb_client_unregister_idx (i);
                     --i;
