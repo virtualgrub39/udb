@@ -23,6 +23,9 @@
 #include "ketopt.h"
 #define STB_DS_IMPLEMENTATION
 #include "stb_ds.h"
+#define LINELEX_IMPLEMENTATION
+#define LINELEX_SHORT_NAMES
+#include "linelex.h"
 
 #include "config.h"
 
@@ -45,6 +48,15 @@ static volatile bool udb_quit = false;
 static size_t fixed_count = 0;
 static struct pollfd *pfds = NULL;
 static UDB_ClientContext **clients = NULL;
+
+enum
+{
+    T_WHITESPACE = 1,
+    T_COMMAND,
+    T_ARGUMENT,
+};
+
+static Lexer lexer = { 0 };
 
 static int log_level = LOG_NOTICE;
 static char *log_filepath = NULL;
@@ -163,7 +175,7 @@ logger_log_errno (int level, const char *fmt, ...)
 #define UNREACHABLE                                                                                \
     do                                                                                             \
     {                                                                                              \
-        logger_log (LOG_CRIT, "%s:%u Entered unreachable part of code! Aborting.", __FILE__,     \
+        logger_log (LOG_CRIT, "%s:%u Entered unreachable part of code! Aborting.", __FILE__,       \
                     __LINE__);                                                                     \
         abort ();                                                                                  \
     } while (0)
@@ -185,13 +197,17 @@ udb_client_register_fd (int cfd)
     if (!c)
         return -1;
 
-    int flags = fcntl (cfd, F_GETFL, 0);
-    if (flags < 0)
-        return flags;
+    int flags = fcntl (cfd, F_GETFL);
+    if (flags == -1)
+        return -1;
+    if (fcntl (cfd, F_SETFL, flags | O_NONBLOCK) == -1)
+        return -1;
 
-    int err = fcntl (cfd, F_SETFL, flags | O_NONBLOCK | FD_CLOEXEC);
-    if (err < 0)
-        return err;
+    int fdflags = fcntl (cfd, F_GETFD);
+    if (fdflags == -1)
+        return -1;
+    if (fcntl (cfd, F_SETFD, fdflags | FD_CLOEXEC) == -1)
+        return -1;
 
     struct pollfd p = { .fd = cfd, .events = POLLIN, .revents = 0 };
 
@@ -201,7 +217,7 @@ udb_client_register_fd (int cfd)
     ssize_t idx = (ssize_t)arrlen (pfds) - 1;
     c->pfd_idx = idx;
 
-    logger_log(LOG_DEBUG, "Registered client idx=%u (fd=%d)", idx, cfd);
+    logger_log (LOG_DEBUG, "Registered client idx=%zd (fd=%d)", idx, cfd);
 
     return idx;
 }
@@ -244,7 +260,7 @@ udb_client_unregister_idx (size_t idx)
     (void)arrpop (pfds);
     (void)arrpop (clients);
 
-    logger_log(LOG_DEBUG, "Unregistered idx=%u", idx);
+    logger_log (LOG_DEBUG, "Unregistered idx=%u", idx);
 
     return 0;
 }
@@ -281,16 +297,15 @@ udb_client_write_async (int idx, int pfx, const char *msg)
         return -1;
     }
 
-    snprintf (c->wbuf, UDB_MAX_MSG_LEN, "%s%s%s\r\n", UDB_PFX_STRINGS[pfx],
-              (pfx != UDB_PFX_NONE && msg[0]) ? " " : "", msg);
-
-    // strlen(c->wbuf) should work, but idk
-    size_t wbuflen = strlen (UDB_PFX_STRINGS[pfx]) + strlen (msg);
-    if (pfx != UDB_PFX_NONE)
-        wbuflen += 1;
-
+    int len = snprintf (c->wbuf, sizeof c->wbuf, "%s%s%s\r\n", UDB_PFX_STRINGS[pfx],
+                        (pfx != UDB_PFX_NONE && msg[0]) ? " " : "", msg);
+    if (len < 0 || (size_t)len >= sizeof c->wbuf)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    c->wlen = (size_t)len;
     c->woff = 0;
-    c->wlen = wbuflen;
 
     udb_client_pollout_set (idx, 1);
 
@@ -314,6 +329,8 @@ udb_client_read (size_t idx)
         ssize_t n = read (cfd, c->abuf + c->aoff, UDB_MAX_MSG_LEN - c->aoff);
         if (n < 0)
             return n;
+        if (n == 0)
+            return -1;
 
         c->aoff += n;
 
@@ -329,22 +346,34 @@ udb_client_read (size_t idx)
 
     if (!terminator_received)
     {
+        if (c->aoff != UDB_MAX_MSG_LEN)
+            return 0;
+
         int err = udb_client_write_async (idx, UDB_PFX_ERR, "message to long");
         if (err < 0)
             return err;
         c->should_exit = true;
+        return 0;
     }
-
-    // TODO: parse message :3
 
     logger_log (LOG_DEBUG, "client[%lu]: %.*s", idx, (int)c->aoff - 2, c->abuf);
 
-    int err = udb_client_write_async (idx, UDB_PFX_OK, "");
-    if (err < 0)
-        return err;
-    c->should_exit = true;
+    TokenArray ta = NULL;
+    ssize_t result = lexer_lex (&lexer, c->abuf, &ta);
+    if (result < 0)
+    {
+        result = udb_client_write_async (idx, UDB_PFX_ERR, "invalid command");
+        c->should_exit = true;
+        return result;
+    }
 
-    return 0;
+    // TODO: pass to handles (udb_handle_GET, udb_handle_PUT, udb_handle_DEL)
+
+    arrfree(ta);
+
+    result = udb_client_write_async (idx, UDB_PFX_OK, "");
+    c->should_exit = true;
+    return result;
 }
 
 static void
@@ -582,7 +611,7 @@ main (int argc, char *argv[])
     ketopt_t s = KETOPT_INIT;
     int c = 0;
     const char *optstr = "hDs:p:v:";
-    int err = -1;
+    ssize_t err = -1;
 
     logger_init ();
 
@@ -649,6 +678,28 @@ main (int argc, char *argv[])
     // logger_close();
 
     // return 0;
+
+    const TokenType tokdefs[] = {
+        TokenTypeDef (T_WHITESPACE, "WHITESPACE", "[\t\r\n ]+", true),
+        TokenTypeDef (T_COMMAND, "COMMAND", "(GET)|(SET)|(DEL)", false),
+        TokenTypeDef (T_ARGUMENT, "ARG_NUM_F32", "[0-9]*\\.[0-9]+([eE][+-]?[0-9]+)?", false),
+        TokenTypeDef (T_ARGUMENT, "ARG_NUM_I", "[0-9]+", false),
+        TokenTypeDef (T_ARGUMENT, "ARG_STR_Q", "\"([^\"\\\\]|\\\\.)*\"", false),
+        TokenTypeDef (T_ARGUMENT, "ARG_STR", "[a-zA-Z_][a-zA-Z0-9_]*", false),
+    };
+
+    lexer_init (&lexer, .auto_anchor = true, .case_insensitive = false, .use_extended_regex = true);
+    long defcount = sizeof (tokdefs) / sizeof (tokdefs[0]);
+    for (long i = 0; i < defcount; ++i)
+    {
+        err = token_type_adds (&lexer, tokdefs[i]);
+        if (err != 0)
+        {
+            logger_log_errno (LOG_CRIT, "Failed to add token type %s (%zu)", tokdefs[i].name, i);
+            LL_lexer_cleanup (&lexer);
+            return 1;
+        }
+    }
 
     int udb_sockfd = socket (AF_UNIX, SOCK_SEQPACKET, 0);
     if (udb_sockfd < 0)
@@ -726,7 +777,7 @@ main (int argc, char *argv[])
         close (udb_sockfd);
         return 1;
     }
-    err = fcntl (udb_sockfd, F_SETFL, flags | O_NONBLOCK | FD_CLOEXEC);
+    err = fcntl (udb_sockfd, F_SETFL, flags | O_NONBLOCK);
     if (err < 0)
     {
         logger_log_errno (LOG_CRIT, "fcntl(F_SETFL) for main socket");
@@ -734,9 +785,21 @@ main (int argc, char *argv[])
         return 1;
     }
 
+    flags = fcntl (udb_sockfd, F_GETFD);
+    if (flags == -1)
+    {
+        close (udb_sockfd);
+        return 1;
+    }
+    if (fcntl (udb_sockfd, F_SETFD, flags | FD_CLOEXEC) == -1)
+    {
+        close (udb_sockfd);
+        return 1;
+    }
+
     if (chmod (udb_socket_path, 0644) < 0)
     {
-        logger_log_errno (LOG_CRIT, "chmod(udb_socket_path)");
+        logger_log_errno (LOG_ERR, "chmod(udb_socket_path)");
         // not fatal
     }
 
@@ -752,15 +815,18 @@ main (int argc, char *argv[])
             return 1;
         }
 
-        int udb_save_timerfd = make_timerfd (5, UDB_DATABASE_SAVE_INTERVAL_SECS);
-        if (udb_save_timerfd < 0)
+        if (UDB_DATABASE_SAVE_INTERVAL_SECS != 0)
         {
-            logger_log_errno (LOG_CRIT, "Failed to create interval timer");
-            close (udb_sockfd);
-            return 1;
-        }
+            int udb_save_timerfd = make_timerfd (5, UDB_DATABASE_SAVE_INTERVAL_SECS);
+            if (udb_save_timerfd < 0)
+            {
+                logger_log_errno (LOG_CRIT, "Failed to create interval timer");
+                close (udb_sockfd);
+                return 1;
+            }
 
-        udb_add_fixed_fd (udb_save_timerfd, POLLIN);
+            udb_add_fixed_fd (udb_save_timerfd, POLLIN);
+        }
     }
 
     struct sigaction udb_sigaction;
@@ -817,7 +883,8 @@ main (int argc, char *argv[])
             continue;
         }
 
-        if (udb_db_path && pfds[1].revents & POLLIN) // timer timeout
+        if (udb_db_path && UDB_DATABASE_SAVE_INTERVAL_SECS
+            && pfds[1].revents & POLLIN) // timer timeout
         {
             unsigned long long expirations;
             ssize_t r = read (pfds[1].fd, &expirations, sizeof (expirations));
@@ -851,7 +918,18 @@ main (int argc, char *argv[])
             {
                 logger_log (LOG_CRIT, "`poll` reported error/hangup/invalid fd: revents=0x%x",
                             pfds[i].revents);
-                goto udb_main_exit;
+                if (i < (ssize_t)fixed_count)
+                {
+                    logger_log (LOG_CRIT, "fixed fd #%zd failed: exiting", i);
+                    goto udb_main_exit;
+                }
+                else
+                {
+                    udb_client_unregister_idx (i);
+                    --i;
+                    total = arrlen (pfds);
+                    continue;
+                }
             }
             if (i < (ssize_t)fixed_count) // fixed fds already handled
                 continue;
@@ -871,7 +949,7 @@ main (int argc, char *argv[])
 
             if (ev & POLLIN)
             {
-                logger_log(LOG_DEBUG, "POLLIN on idx=%u", i);
+                logger_log (LOG_DEBUG, "POLLIN on idx=%zd", i);
                 err = udb_client_read (i);
 
                 if (err < 0)
@@ -889,11 +967,11 @@ main (int argc, char *argv[])
 
             if (ev & POLLOUT)
             {
-                logger_log(LOG_DEBUG, "POLLOUT on idx=%u", i);
+                logger_log (LOG_DEBUG, "POLLOUT on idx=%zd", i);
 
                 if (c->wlen > c->woff)
                 {
-                    ssize_t w = write (pfds[c->pfd_idx].fd, c->wbuf + c->woff, c->wlen - c->woff);
+                    ssize_t w = write (pfds[i].fd, c->wbuf + c->woff, c->wlen - c->woff);
                     if (w > 0)
                     {
                         c->woff += (size_t)w;
@@ -962,6 +1040,8 @@ udb_main_exit:
 
         arrfree (clients);
     }
+
+    lexer_cleanup (&lexer);
 
     logger_log (LOG_DEBUG, "Deinit done - about to close");
     logger_close ();
