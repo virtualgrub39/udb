@@ -1,6 +1,8 @@
 // requires _POSIX_C_SOURCE=200112L
 
+#include <ctype.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,9 +38,8 @@
 typedef struct
 {
     ssize_t pfd_idx;
-    size_t wlen, woff, aoff;
+    size_t wlen, woff;
     char wbuf[UDB_MAX_MSG_LEN];
-    char abuf[UDB_MAX_MSG_LEN];
     bool should_exit;
 } UDB_ClientContext;
 
@@ -49,11 +50,39 @@ static size_t fixed_count = 0;
 static struct pollfd *pfds = NULL;
 static UDB_ClientContext **clients = NULL;
 
+typedef struct
+{
+    char *key;
+    size_t len;
+    char *value;
+} UDB_Entry;
+
+static struct
+{
+    uint64_t key;
+    UDB_Entry *value;
+} *UDB_map = NULL;
+
+static uint64_t
+hash64 (const char *p, size_t n)
+{
+    return (uint64_t)stbds_hash_bytes ((char *)p, n, UDB_DATABASE_MEMORY_HASH_SEED);
+}
+
 enum
 {
     T_WHITESPACE = 1,
     T_COMMAND,
     T_ARGUMENT,
+};
+
+const TokenType tokdefs[] = {
+    { T_WHITESPACE, "WHITESPACE", "[\t\r\n ]+", true, { 0 } },
+    { T_COMMAND, "COMMAND", "(GET)|(SET)|(DEL)", false, { 0 } },
+    { T_ARGUMENT, "ARG_NUM_F32", "[0-9]*\\.[0-9]+([eE][+-]?[0-9]+)?", false, { 0 } },
+    { T_ARGUMENT, "ARG_NUM_I", "[0-9]+", false, { 0 } },
+    { T_ARGUMENT, "ARG_STR_Q", "\"([^\"\\\\]|\\\\.)*\"", false, { 0 } },
+    { T_ARGUMENT, "ARG_STR", "[a-zA-Z_][a-zA-Z0-9_]*", false, { 0 } },
 };
 
 static Lexer lexer = { 0 };
@@ -172,6 +201,66 @@ logger_log_errno (int level, const char *fmt, ...)
     logger_log (level, "%s : %s (%d)", userbuf, estrp, saved_errno);
 }
 
+static inline void
+logger_log_hexdump (uint8_t *bytes, size_t len)
+{
+    if (bytes == NULL)
+    {
+        logger_log (LOG_DEBUG, "hexdump: <null>");
+        return;
+    }
+
+    if (len == 0)
+    {
+        logger_log (LOG_DEBUG, "hexdump: <empty>");
+        return;
+    }
+
+    const size_t cols = 16;
+    char line[128];
+
+    for (size_t off = 0; off < len; off += cols)
+    {
+        size_t row_len = (len - off) < cols ? (len - off) : cols;
+        int pos = 0;
+
+        /* Offset */
+        pos += snprintf (line + pos, sizeof (line) - pos, "%08zx: ", off);
+
+        /* Hex bytes (with extra space after 8 bytes for readability) */
+        for (size_t i = 0; i < cols; ++i)
+        {
+            if (i < row_len)
+                pos += snprintf (line + pos, sizeof (line) - pos, "%02x", bytes[off + i]);
+            else
+                pos += snprintf (line + pos, sizeof (line) - pos, "  ");
+
+            /* spacing */
+            if (i == 7)
+                pos += snprintf (line + pos, sizeof (line) - pos, "  ");
+            else
+                pos += snprintf (line + pos, sizeof (line) - pos, " ");
+
+            if ((size_t)pos >= sizeof (line) - 1)
+                break;
+        }
+
+        /* ASCII representation */
+        pos += snprintf (line + pos, sizeof (line) - pos, "|");
+        for (size_t i = 0; i < row_len; ++i)
+        {
+            unsigned char c = bytes[off + i];
+            pos += snprintf (line + pos, sizeof (line) - pos, "%c", isprint (c) ? c : '.');
+            if ((size_t)pos >= sizeof (line) - 1)
+                break;
+        }
+        pos += snprintf (line + pos, sizeof (line) - pos, "|");
+
+        /* Emit the line */
+        logger_log (LOG_DEBUG, "%s", line);
+    }
+}
+
 #define UNREACHABLE                                                                                \
     do                                                                                             \
     {                                                                                              \
@@ -283,6 +372,7 @@ udb_client_write_async (int idx, int pfx, const char *msg)
 {
     if (!msg || strlen (msg) > UDB_MAX_MSG_LEN - 4)
     {
+        logger_log (LOG_DEBUG, "raising EINVAL in write_async");
         errno = EINVAL;
         return -1;
     }
@@ -315,7 +405,43 @@ udb_client_write_async (int idx, int pfx, const char *msg)
 static const char *
 udb_handle_get (TokenArray args)
 {
-    (void)args;
+    if (arrlen (args) > 1)
+    {
+        errno = E2BIG;
+        return NULL;
+    }
+
+    Token t = args[0];
+
+    if (strcmp (tokdefs[t.type_idx].name, "ARG_STR_Q") != 0
+        && strcmp (tokdefs[t.type_idx].name, "ARG_STR") != 0)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    uint64_t h = hash64 (t.ptr, t.len);
+    UDB_Entry *bucket = hmget (UDB_map, h);
+    if (!bucket)
+    {
+        errno = ENODATA;
+        return NULL;
+    }
+
+    for (long i = 0; i < arrlen (bucket); ++i)
+    {
+        if (bucket[i].len == t.len && memcmp (bucket[i].key, t.ptr, t.len) == 0)
+        {
+            if (bucket[i].value)
+                return bucket[i].value;
+            else
+            {
+                errno = ENODATA;
+                return NULL;
+            }
+        }
+    }
+
     errno = ENODATA;
     return NULL;
 }
@@ -323,17 +449,144 @@ udb_handle_get (TokenArray args)
 static ssize_t
 udb_handle_set (TokenArray args)
 {
-    (void)args;
-    errno = EINVAL;
-    return -1;
+    if (arrlen (args) > 2)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+
+    Token tkey = args[0];
+    Token tval = args[1];
+
+    char *key = malloc (tkey.len + 1);
+    if (!key)
+        return -1;
+    memcpy (key, tkey.ptr, tkey.len);
+    key[tkey.len] = '\0';
+    size_t keylen = tkey.len;
+
+    char *val = malloc (tval.len + 1);
+    if (!val)
+    {
+        free (key);
+        return -1;
+    }
+    memcpy (val, tval.ptr, tval.len);
+    val[tval.len] = '\0';
+
+    uint64_t h = hash64 (tkey.ptr, keylen);
+    UDB_Entry *bucket = hmget (UDB_map, h);
+
+    if (bucket)
+    {
+        for (long i = 0; i < arrlen (bucket); ++i)
+        {
+            if (bucket[i].len == keylen && memcmp (bucket[i].key, tkey.ptr, keylen) == 0)
+            {
+                free (bucket[i].value);
+                bucket[i].value = val;
+                free (key);
+                return 0;
+            }
+        }
+        UDB_Entry e = (UDB_Entry){ .key = key, .value = val, .len = keylen };
+        arrpush (bucket, e);
+        hmput (UDB_map, h, bucket);
+    }
+    else
+    {
+        UDB_Entry *newbucket = NULL;
+        UDB_Entry e = (UDB_Entry){ .key = key, .value = val, .len = keylen };
+        arrpush (newbucket, e);
+        hmput (UDB_map, h, newbucket);
+    }
+
+    return 0;
 }
 
-static const char *
+static char *
 udb_handle_del (TokenArray args)
 {
-    (void)args;
+    if (arrlen (args) != 1)
+    {
+        errno = E2BIG;
+        return NULL;
+    }
+
+    Token t = args[0];
+
+    if (strcmp (tokdefs[t.type_idx].name, "ARG_STR_Q") != 0
+        && strcmp (tokdefs[t.type_idx].name, "ARG_STR") != 0)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    uint64_t h = hash64 (t.ptr, t.len);
+    UDB_Entry *bucket = hmget (UDB_map, h);
+    if (!bucket)
+    {
+        errno = ENODATA;
+        return NULL;
+    }
+
+    for (long i = 0; i < arrlen (bucket); ++i)
+    {
+        if (bucket[i].len == t.len && memcmp (bucket[i].key, t.ptr, t.len) == 0)
+        {
+            free (bucket[i].key);
+            char *v = (bucket[i].value);
+
+            for (long j = i; j < arrlen (bucket) - 1; ++j)
+            {
+                bucket[j] = bucket[j + 1];
+            }
+            arrsetlen (bucket, arrlen (bucket) - 1);
+            if (arrlen (bucket) == 0)
+            {
+                arrfree (bucket);
+                (void)hmdel (UDB_map, h);
+            }
+            else
+            {
+                hmput (UDB_map, h, bucket);
+            }
+
+            return v;
+        }
+    }
+
     errno = ENODATA;
     return NULL;
+}
+
+void
+udb_db_init (void)
+{
+    UDB_map = NULL;
+}
+
+void
+udb_db_free (void)
+{
+    if (!UDB_map)
+        return;
+
+    for (long i = 0; i < hmlen (UDB_map); ++i)
+    {
+        UDB_Entry *bucket = UDB_map[i].value;
+        if (bucket)
+        {
+            for (long j = 0; j < arrlen (bucket); ++j)
+            {
+                free (bucket[j].key);
+                free (bucket[j].value);
+            }
+            arrfree (bucket);
+        }
+    }
+    hmfree (UDB_map);
+    UDB_map = NULL;
 }
 
 static ssize_t
@@ -345,46 +598,35 @@ udb_client_read (size_t idx)
 
     int cfd = pfds[c->pfd_idx].fd;
 
-    bool terminator_received = false;
+    char inbuff[UDB_MAX_MSG_LEN] = { 0 };
 
-    while (true)
+    ssize_t n = read (cfd, inbuff, UDB_MAX_MSG_LEN);
+    if (n <= 0)
+        return n;
+
+    logger_log (LOG_DEBUG, "received %zu bytes from idx=%zu", n, idx);
+    logger_log_hexdump ((uint8_t *)inbuff, n);
+
+    // leftover from first API version - message structure is [COMMAND] [ARG1][ ARG2][...]\r\n
+    // We have to include terminator bytes even though with SCTP partial reads should be impossible
+    if (n < 2 || inbuff[n - 2] != '\r' || inbuff[n - 1] != '\n')
     {
-        ssize_t n = read (cfd, c->abuf + c->aoff, UDB_MAX_MSG_LEN - c->aoff);
-        if (n <= 0)
-            return n;
-
-        c->aoff += n;
-
-        if (strstr (c->abuf, "\r\n") != NULL)
-        {
-            terminator_received = true;
-            break;
-        }
-
-        if (c->aoff >= UDB_MAX_MSG_LEN)
-            break;
-    }
-
-    if (!terminator_received)
-    {
-        if (c->aoff != UDB_MAX_MSG_LEN)
-            return 0;
-
-        int err = udb_client_write_async (idx, UDB_PFX_ERR, "message to long");
+        int err = udb_client_write_async (idx, UDB_PFX_ERR, "invalid message");
         if (err < 0)
             return err;
+        logger_log (LOG_DEBUG, "marking idx=%zu for termination (bad command structure)", idx);
         c->should_exit = true;
         return 0;
     }
 
-    logger_log (LOG_DEBUG, "client[%lu]: %.*s", idx, (int)c->aoff - 2, c->abuf);
-
     TokenArray ta = NULL;
-    ssize_t result = lexer_lex (&lexer, c->abuf, &ta);
+    ssize_t result = lexer_lex (&lexer, inbuff, &ta);
     if (result < 0 || ta[0].type != T_COMMAND)
     {
         result = udb_client_write_async (idx, UDB_PFX_ERR, "invalid command");
         c->should_exit = true;
+        logger_log (LOG_DEBUG, "Marking %zu for termination (did not pass lexing)", idx);
+        logger_log (LOG_DEBUG, "udb_client_read failed with invalid command. Result: %d", result);
         return result;
     }
 
@@ -400,7 +642,13 @@ udb_client_read (size_t idx)
             switch (errno)
             {
             case ENODATA:
-                result = udb_client_write_async (idx, UDB_PFX_ERR, "");
+                result = udb_client_write_async (idx, UDB_PFX_NONE, "NULL");
+                break;
+            case E2BIG:
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "to many arguments");
+                break;
+            case EINVAL:
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "invalid key type");
                 break;
             default:
                 logger_log_errno (LOG_WARNING, "DB GET failed");
@@ -408,8 +656,8 @@ udb_client_read (size_t idx)
                 break;
             }
         }
-
-        result = udb_client_write_async (idx, UDB_PFX_OK, v);
+        else
+            result = udb_client_write_async (idx, UDB_PFX_NONE, v);
     }
     else if (strncmp (cmd_ptr, "SET", cmd_len) == 0)
     {
@@ -417,20 +665,29 @@ udb_client_read (size_t idx)
         if (result < 0)
         {
             logger_log_errno (LOG_WARNING, "DB SET failed");
-            result = udb_client_write_async (idx, UDB_PFX_ERR, "internal server error");
+            if (errno == E2BIG)
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "to many arguments");
+            else
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "internal server error");
         }
 
         result = udb_client_write_async (idx, UDB_PFX_OK, "");
     }
     else if (strncmp (cmd_ptr, "DEL", cmd_len) == 0)
     {
-        const char *v = udb_handle_del (ta);
+        char *v = udb_handle_del (ta);
         if (v == NULL)
         {
             switch (errno)
             {
             case ENODATA:
-                result = udb_client_write_async (idx, UDB_PFX_OK, "");
+                result = udb_client_write_async (idx, UDB_PFX_OK, "NULL");
+                break;
+            case E2BIG:
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "to many arguments");
+                break;
+            case EINVAL:
+                result = udb_client_write_async (idx, UDB_PFX_ERR, "invalid key type");
                 break;
             default:
                 logger_log_errno (LOG_WARNING, "DB DEL failed");
@@ -438,14 +695,19 @@ udb_client_read (size_t idx)
                 break;
             }
         }
-
-        result = udb_client_write_async (idx, UDB_PFX_OK, v);
+        else
+        {
+            result = udb_client_write_async (idx, UDB_PFX_NONE, v);
+            free (v);
+        }
     }
     else
         UNREACHABLE;
 
     arrfree (ta);
-    return result;
+    if (result < 0)
+        return result;
+    return n;
 }
 
 static void
@@ -751,15 +1013,6 @@ main (int argc, char *argv[])
 
     // return 0;
 
-    const TokenType tokdefs[] = {
-        TokenTypeDef (T_WHITESPACE, "WHITESPACE", "[\t\r\n ]+", true),
-        TokenTypeDef (T_COMMAND, "COMMAND", "(GET)|(SET)|(DEL)", false),
-        TokenTypeDef (T_ARGUMENT, "ARG_NUM_F32", "[0-9]*\\.[0-9]+([eE][+-]?[0-9]+)?", false),
-        TokenTypeDef (T_ARGUMENT, "ARG_NUM_I", "[0-9]+", false),
-        TokenTypeDef (T_ARGUMENT, "ARG_STR_Q", "\"([^\"\\\\]|\\\\.)*\"", false),
-        TokenTypeDef (T_ARGUMENT, "ARG_STR", "[a-zA-Z_][a-zA-Z0-9_]*", false),
-    };
-
     lexer_init (&lexer, .auto_anchor = true, .case_insensitive = false, .use_extended_regex = true);
     long defcount = sizeof (tokdefs) / sizeof (tokdefs[0]);
     for (long i = 0; i < defcount; ++i)
@@ -772,6 +1025,8 @@ main (int argc, char *argv[])
             return 1;
         }
     }
+
+    udb_db_init ();
 
     int udb_sockfd = socket (AF_UNIX, SOCK_SEQPACKET, 0);
     if (udb_sockfd < 0)
@@ -1030,6 +1285,7 @@ main (int argc, char *argv[])
                         continue;
 
                     // disconnect
+                    logger_log_errno (LOG_DEBUG, "disconnect reason: result < 0 (error)");
                     udb_client_unregister_idx (i);
                     --i;
                     total = arrlen (pfds);
@@ -1039,6 +1295,7 @@ main (int argc, char *argv[])
                 if (err == 0)
                 {
                     // disconnect
+                    logger_log (LOG_DEBUG, "disconnect reason: client send 0 byte long datagram");
                     udb_client_unregister_idx (i);
                     --i;
                     total = arrlen (pfds);
@@ -1052,6 +1309,9 @@ main (int argc, char *argv[])
 
                 if (c->wlen > c->woff)
                 {
+                    logger_log (LOG_DEBUG, "Writing %zu bytes to idx=%lu (fd=%d)", c->wlen, i,
+                                pfds[i].fd);
+
                     ssize_t w = write (pfds[i].fd, c->wbuf + c->woff, c->wlen - c->woff);
                     if (w > 0)
                     {
@@ -1073,6 +1333,7 @@ main (int argc, char *argv[])
 
                 if (c->should_exit)
                 {
+                    logger_log (LOG_DEBUG, "disconnect reason: exit flag flipped");
                     udb_client_unregister_idx (i);
                     --i;
                     total = arrlen (pfds);
@@ -1123,6 +1384,8 @@ udb_main_exit:
     }
 
     lexer_cleanup (&lexer);
+
+    udb_db_free ();
 
     logger_log (LOG_DEBUG, "Deinit done - about to close");
     logger_close ();

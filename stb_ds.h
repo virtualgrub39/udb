@@ -505,12 +505,12 @@ extern void * stbds_shmode_func(size_t elemsize, int mode);
 }
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#define STBDS_HAS_TYPEOF
-#ifdef __cplusplus
-//#define STBDS_HAS_LITERAL_ARRAY  // this is currently broken for clang
-#endif
-#endif
+// #if defined(__GNUC__) || defined(__clang__)
+// #define STBDS_HAS_TYPEOF
+// #ifdef __cplusplus
+// //#define STBDS_HAS_LITERAL_ARRAY  // this is currently broken for clang
+// #endif
+// #endif
 
 #if !defined(__cplusplus)
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
