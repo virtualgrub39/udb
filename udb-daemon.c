@@ -980,10 +980,10 @@ main (int argc, char *argv[])
             log_filepath = s.arg;
             break;
         case '?':
-            logger_log (LOG_ERR, "Unknown option: %s", argv[s.ind - 1]);
+            logger_log (LOG_ERR, "Unknown option: %s", argv[s.ind]);
             return 1;
         case ':':
-            logger_log (LOG_ERR, "Option requires an argument: %s", argv[s.ind - 1]);
+            logger_log (LOG_ERR, "Option requires an argument: %s", argv[s.ind]);
             return 1;
         default:
             UNREACHABLE;
