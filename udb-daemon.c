@@ -76,7 +76,7 @@ enum
     T_ARGUMENT,
 };
 
-const TokenType tokdefs[] = {
+static const TokenType tokdefs[] = {
     { T_WHITESPACE, "WHITESPACE", "[\t\r\n ]+", true, { 0 } },
     { T_COMMAND, "COMMAND", "(GET)|(SET)|(DEL)", false, { 0 } },
     { T_ARGUMENT, "ARG_NUM_F32", "[0-9]*\\.[0-9]+([eE][+-]?[0-9]+)?", false, { 0 } },
@@ -201,7 +201,7 @@ logger_log_errno (int level, const char *fmt, ...)
     logger_log (level, "%s : %s (%d)", userbuf, estrp, saved_errno);
 }
 
-static inline void
+static void
 logger_log_hexdump (uint8_t *bytes, size_t len)
 {
     if (bytes == NULL)
@@ -624,8 +624,6 @@ udb_client_read (size_t idx)
     if (result < 0 || ta[0].type != T_COMMAND)
     {
         result = udb_client_write_async (idx, UDB_PFX_ERR, "invalid command");
-        c->should_exit = true;
-        logger_log (LOG_DEBUG, "Marking %zu for termination (did not pass lexing)", idx);
         logger_log (LOG_DEBUG, "udb_client_read failed with invalid command. Result: %d", result);
         return result;
     }
@@ -681,7 +679,7 @@ udb_client_read (size_t idx)
             switch (errno)
             {
             case ENODATA:
-                result = udb_client_write_async (idx, UDB_PFX_OK, "NULL");
+                result = udb_client_write_async (idx, UDB_PFX_NONE, "NULL");
                 break;
             case E2BIG:
                 result = udb_client_write_async (idx, UDB_PFX_ERR, "to many arguments");
