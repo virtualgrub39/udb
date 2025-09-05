@@ -399,7 +399,7 @@ udb_client_write_async (int idx, int pfx, const char *msg)
 
     udb_client_pollout_set (idx, 1);
 
-    return 0;
+    return 2137; // ?
 }
 
 static const char *
